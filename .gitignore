@@ -1,0 +1,18 @@
+# Secrets & environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# Python (if applicable)
+__pycache__/
+*.pyc
+.venv/
+
+# Node (if applicable)
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
