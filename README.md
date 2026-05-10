@@ -14,6 +14,9 @@ CLIENT_SECRET=
 API_USERNAME=
 API_PASSWORD=
 
+OneBill Configurations:
+PROXY_ACCOUNT_NUMBER=
+
 # Build and Test
 TODO: Describe and show how to build your code and run the tests. 
 
