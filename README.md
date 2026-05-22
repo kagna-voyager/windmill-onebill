@@ -2,20 +2,43 @@
 The files in this repo are used to migrate and sync data between OneBill and other external DBs.
 
 # Getting Started
-Create you own .env file (the are ignored in the git commits as they contain confidential iformation)
+Create you own .env file (these are ignored in the git commits as they contain confidential iformation)
 Add the following variables with your unique values:
+
+MySQL Connections:
 DB_USERNAME=
 DB_PASSWORD=
 DB_HOST=
 
 OneBill Connections:
-CLIENT_ID=voyagersbx
+CLIENT_ID=
 CLIENT_SECRET=
-API_USERNAME=
+API_USERNAME=api.usersbx
 API_PASSWORD=
+ONEBILL_BASE_URL=
 
 OneBill Configurations:
-PROXY_ACCOUNT_NUMBER=
+DELETION_PROXY_ACCOUNT_NUMBER=
+CREATION_PROXY_ACCOUNT_NUMBER=
+
+PROD Dynamics Connections:
+CRM_TENANT_ID=
+CRM_CLIENT_ID=
+CRM_CLIENT_SECRET=
+CRM_ENVIRONMENT_URL=
+
+DEV Dynamics Connections:
+DEV_CRM_TENANT_ID=
+DEV_CRM_CLIENT_ID=
+DEV_CRM_CLIENT_SECRET=
+DEV_CRM_ENVIRONMENT_URL=
+
+The variable names must be identical as these are called within the scripts.
+
+To migrate customers into OneBill use the 'OneBill Customer Migration' file. As simple as just hitting 'Run All', but you might just want to make the dataframes smaller the first couple run throughs.
+Close Partner Accounts closes all accounts under a parter. Partners can't be closed when there is an active account under it.
+Close vBill Accounts I run after the migration file to close any 'Deactivated' accounts that were in vBill.
+
 
 # Build and Test
 TODO: Describe and show how to build your code and run the tests. 
