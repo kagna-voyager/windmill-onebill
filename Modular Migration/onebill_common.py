@@ -60,6 +60,7 @@ from collections import defaultdict
 import requests
 import pandas as pd
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv(override=True)
 
@@ -554,7 +555,12 @@ DEFAULT_ORDER_STATE = "1005"
 DEFAULT_ACTION_TYPE  = "New"
 DEFAULT_QUANTITY     = 1
 
-USE_ATTRIBUTE_STYLE_FOR_USN_FIELDS = False       # see assumption #3 above
+USE_ATTRIBUTE_STYLE_FOR_USN_FIELDS = True        # confirmed against working Postman payload —
+                                                   # OneBill wants these as orderElementAttribute
+                                                   # entries ("Imported Subscription USN" /
+                                                   # "Subscription Username"), not as top-level
+                                                   # orderElement fields (importedSubscriptionUsn /
+                                                   # subscriptionUsername), which it silently ignores
 ATTACH_CONTACT_SUMMARY_TO_ORDER    = True        # see assumption #5 above
 
 # Used when a subscription's plan code has no match in the product/price-plan
@@ -591,6 +597,15 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
+# Module-level logger for onebill_common.py's own internal functions (e.g. the
+# Voyager retry wrapper below). Notebooks create their own logger via
+# get_logger(name) for their own log lines — this is separate and only used
+# by code that lives inside this file, since a bare `logger` reference inside
+# a function defined here resolves against THIS module's globals, not
+# whatever `from onebill_common import *` happened to pull into the notebook.
+logger = get_logger("onebill_common")
+
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
@@ -611,6 +626,39 @@ def to_iso_midnight(value) -> str | None:
         return None
     ts = pd.Timestamp(value)
     return ts.strftime("%Y-%m-%dT00:00:00")
+
+
+# ---------------------------------------------------------------------------
+# Supplier -> OneBill "Vendor" attribute mapping
+#
+# `Supplier` (from bi_datastore.billing_subscription) needs mapping onto
+# OneBill's Vendor picklist for the "Vendor" orderElementAttribute. Only
+# Chorus / Enable / UFF show up in MySQL for the accounts migrated so far,
+# so only those are mapped below. UFF maps to OneBill's "tff" value — UFF
+# was renamed to Tuatahi First Fibre and OneBill still calls it "tff".
+#
+# Full OneBill Vendor picklist, for reference when new suppliers turn up:
+#   chorus (1067), enable (1066), tff (1065) [was UFF], litNetworks (1061),
+#   networkTasman (1060), northpower (1068), chorusWireline (1064),
+#   oneNz (1063), 2degrees (1062)
+# ---------------------------------------------------------------------------
+SUPPLIER_TO_VENDOR = {
+    "chorus": "chorus",
+    "enable": "enable",
+    "uff":    "tff",
+}
+
+
+def resolve_vendor(supplier) -> str | None:
+    """Map a MySQL `Supplier` value onto OneBill's Vendor picklist value.
+
+    Returns None if `supplier` is blank or not a supplier we have a mapping
+    for yet — callers should decide whether that's worth a warning.
+    """
+    supplier = clean(supplier)
+    if supplier is None:
+        return None
+    return SUPPLIER_TO_VENDOR.get(str(supplier).strip().lower())
 
 
 def months_between(start, end) -> int:
@@ -758,6 +806,95 @@ def new_voyager_session(max_workers: int = MAX_WORKERS) -> requests.Session:
 
 
 # ---------------------------------------------------------------------------
+# Voyager rate limiting — every subscription does 2 sequential Voyager calls
+# (circuits, then address-search), and the API returns 429s well before any
+# reasonable worker count would suggest. Two mechanisms, both global (shared
+# across all threads, not per-worker):
+#   1. A minimum spacing between any two Voyager requests, so N workers don't
+#      just recreate the same burst by firing in a tight loop.
+#   2. Retry-with-backoff specifically for 429, honoring Retry-After if the
+#      API sends one, otherwise exponential backoff with jitter.
+# Tune VOYAGER_MIN_REQUEST_INTERVAL_SECONDS down if 429s stop appearing, or
+# up if they persist even after this change.
+# ---------------------------------------------------------------------------
+VOYAGER_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+VOYAGER_MAX_RETRIES = 6
+VOYAGER_BACKOFF_BASE_SECONDS = 1.0
+VOYAGER_5XX_MAX_RETRIES = 3
+VOYAGER_5XX_BACKOFF_BASE_SECONDS = 2.0
+VOYAGER_RETRYABLE_5XX = {500, 502, 503, 504}
+
+_voyager_throttle_lock = threading.Lock()
+_voyager_last_request_at = 0.0
+
+
+def _voyager_throttle():
+    """Block the calling thread until at least VOYAGER_MIN_REQUEST_INTERVAL_SECONDS
+    has elapsed since the last Voyager request from ANY thread."""
+    global _voyager_last_request_at
+    with _voyager_throttle_lock:
+        now = time.monotonic()
+        wait = VOYAGER_MIN_REQUEST_INTERVAL_SECONDS - (now - _voyager_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _voyager_last_request_at = time.monotonic()
+
+
+def _voyager_get_with_retry(session: requests.Session, url: str, headers: dict) -> requests.Response:
+    """GET with global throttling + retry-with-backoff on 429 and transient 5xx.
+    404s and other 4xx are NOT retried (retrying won't make a missing circuit
+    exist) — those raise immediately via raise_for_status().
+
+    429: honors Retry-After if Voyager sends one, otherwise exponential backoff,
+    up to VOYAGER_MAX_RETRIES attempts (Voyager's own Retry-After values have
+    been observed up to ~60s, so this can legitimately take a while).
+
+    5xx (500/502/503/504): no Retry-After to honor here, so a shorter
+    exponential backoff with fewer attempts (VOYAGER_5XX_MAX_RETRIES) — enough
+    to ride out a transient blip without masking a persistently broken circuit
+    behind minutes of retries.
+    """
+    last_exc = None
+    attempt_429 = 0
+    attempt_5xx = 0
+
+    while True:
+        _voyager_throttle()
+        response = session.get(url, headers=headers, timeout=30)
+
+        if response.status_code == 429:
+            if attempt_429 >= VOYAGER_MAX_RETRIES:
+                response.raise_for_status()
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = VOYAGER_BACKOFF_BASE_SECONDS * (2 ** attempt_429)
+            else:
+                delay = VOYAGER_BACKOFF_BASE_SECONDS * (2 ** attempt_429)
+            delay += random.uniform(0, 0.5)  # jitter, so parallel workers don't retry in lockstep
+            logger.warning(f"Voyager 429 on {url} — retry {attempt_429 + 1}/{VOYAGER_MAX_RETRIES} in {delay:.1f}s")
+            attempt_429 += 1
+            time.sleep(delay)
+            continue
+
+        if response.status_code in VOYAGER_RETRYABLE_5XX:
+            if attempt_5xx >= VOYAGER_5XX_MAX_RETRIES:
+                response.raise_for_status()
+            delay = VOYAGER_5XX_BACKOFF_BASE_SECONDS * (2 ** attempt_5xx) + random.uniform(0, 0.5)
+            logger.warning(
+                f"Voyager {response.status_code} on {url} — retry {attempt_5xx + 1}/{VOYAGER_5XX_MAX_RETRIES} in {delay:.1f}s"
+            )
+            attempt_5xx += 1
+            time.sleep(delay)
+            continue
+
+        response.raise_for_status()
+        return response
+
+
+# ---------------------------------------------------------------------------
 # Address parsing from the subscription (vBill) label — SUPERSEDED
 #
 # Kept only as a fallback/reference. 05_Fetch_Subscriptions.ipynb now uses
@@ -839,16 +976,14 @@ def fetch_voyager_circuit(session: requests.Session, supplier_service_id: str) -
     """GET the circuit detail for one SupplierServiceID."""
     url = f"{VOYAGER_CIRCUITS_URL}/{supplier_service_id}"
     headers = {"X-Api-Key": VOYAGER_CCP_KEY, "X-Partner-Id": VOYAGER_PARTNER_ID}
-    response = session.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
+    response = _voyager_get_with_retry(session, url, headers)
     return response.json()
 
 
 def fetch_voyager_address(session: requests.Session, location_id: str) -> dict:
     """GET the full address record for one locationId."""
     url = f"{VOYAGER_ADDRESS_SEARCH_URL}/{location_id}"
-    response = session.get(url, headers={"accept": "application/json"}, timeout=30)
-    response.raise_for_status()
+    response = _voyager_get_with_retry(session, url, {"accept": "application/json"})
     return response.json()
 
 
@@ -928,6 +1063,74 @@ def get_voyager_address(session: requests.Session, supplier_service_id) -> dict:
         result["error"] = "address-search response had no street_address"
 
     return result
+
+
+# Matches a 5xx status code appearing anywhere in a ParsedAddress_error string,
+# e.g. "circuits lookup failed: 500 Server Error: ..." or "... 503 ...".
+# Deliberately does NOT match 404 ("Not Found" — permanent, not transient) or
+# "no SupplierServiceID on this subscription" (a data problem, not an API one).
+_VOYAGER_5XX_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+
+
+def voyager_second_pass(
+    df: pd.DataFrame,
+    session: requests.Session,
+    delay_seconds: float = 90.0,
+    max_workers: int = 2,
+) -> pd.DataFrame:
+    """Retry Voyager lookups for rows that failed with a transient 5xx on the
+    first pass, after waiting `delay_seconds`.
+
+    Intended to run as a SEPARATE, later pass after the main Voyager lookup in
+    05_Fetch_Subscriptions.ipynb. get_voyager_address()/_voyager_get_with_retry()
+    already retry a 5xx up to VOYAGER_5XX_MAX_RETRIES times with a short backoff
+    (a few seconds each) — but some backend errors are only transient over a
+    longer horizon (minutes) than that. This is that longer, second attempt.
+
+    404s and "no SupplierServiceID" failures are intentionally NOT retried
+    here — those are permanent (a missing circuit or missing source data isn't
+    going to appear because we waited longer).
+
+    Mutates `df` in place (only overwrites ParsedAddress_* columns for rows
+    that get retried; rows are otherwise untouched) and also returns it, so
+    it drops straight into `df_subscriptions = voyager_second_pass(df_subscriptions, ...)`.
+    """
+    needs_retry = df[
+        (~df["ParsedAddress_parsed_ok"])
+        & (df["ParsedAddress_error"].fillna("").str.contains(_VOYAGER_5XX_ERROR_PATTERN))
+    ]
+
+    if needs_retry.empty:
+        logger.info("Voyager second pass: nothing to retry (no transient-5xx failures from the first pass).")
+        return df
+
+    logger.info(
+        f"Voyager second pass: {len(needs_retry):,} subscriptions failed with a transient 5xx on the "
+        f"first pass — waiting {delay_seconds:.0f}s before retrying..."
+    )
+    time.sleep(delay_seconds)
+
+    def _lookup(supplier_service_id):
+        return get_voyager_address(session, supplier_service_id)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        retry_results = list(executor.map(_lookup, needs_retry["SupplierServiceID"]))
+
+    retry_parts = pd.DataFrame(retry_results, index=needs_retry.index).add_prefix("ParsedAddress_")
+    df.update(retry_parts)  # only touches matching (index, column) cells — everything else is untouched
+
+    now_resolved = int(retry_parts["ParsedAddress_parsed_ok"].sum())
+    logger.info(f"Voyager second pass: {now_resolved:,} / {len(needs_retry):,} resolved on retry.")
+
+    still_unparsed = df[~df["ParsedAddress_parsed_ok"]]
+    if not still_unparsed.empty:
+        error_summary = (
+            still_unparsed["ParsedAddress_error"].value_counts(dropna=False)
+            .rename_axis("error").reset_index(name="count")
+        )
+        logger.info(f"{len(still_unparsed):,} subscriptions still unresolved after second pass:\n" + error_summary.to_string(index=False))
+
+    return df
 
 
 def resolve_target_account(reference) -> dict:
@@ -1126,6 +1329,18 @@ def add_address_to_account(
     the real values from get_voyager_address() (05_Fetch_Subscriptions.ipynb)
     whenever they're available.
 
+    Every address is created with defaultShipping=true, so each new address
+    supersedes the previous default — the account's default service address
+    ends up being whichever address was created *last*.
+
+    CAUTION: 06_Create_Addresses.ipynb runs create_address_for_subscription
+    through a ThreadPoolExecutor (MAX_WORKERS workers), so "last" here means
+    whichever PUT happens to land last on OneBill's side — NOT necessarily the
+    last row for that account in df_subscriptions. If a specific subscription's
+    address needs to deterministically end up as the default (rather than
+    "whichever one wins the race"), either run 06 with max_workers=1, or add
+    logic that only sets defaultShipping=true for that specific subscription.
+
     status: "created" | "exists" | "failed". "exists" means an address with this
     location_id was already on the account — the PUT is skipped entirely, so
     re-running this notebook against an account that's already been processed
@@ -1179,13 +1394,12 @@ def _put_address_locked(
                 "country":         "NEW ZEALAND",
                 "state":           region_iso,
                 "county":          "",
-                "defaultBilling":  "false",
-                "defaultShipping": "true",
+                "defaultBilling":  False,
                 "city":            city,
                 "addLine1":        add_line1,
                 "addLine2":        address2 or "",
-                "defaultShipping": "false",
-                "addressAttribute": [
+                "defaultShipping": True,
+                "locationAttributes": [
                     {"key": "Location Id", "value": location_id},
                 ],
             }
