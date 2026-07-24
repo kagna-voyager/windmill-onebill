@@ -32,10 +32,9 @@ before a production run — each is flagged again at its point of use)
    placeholders until you set the env vars / edit the constants below.
 2. SUBSCRIPTION_REFERENCE_COLUMN / SUBSCRIPTION_PLANCODE_COLUMN — set these
    to whatever your MySQL query actually returns.
-3. "Subscription Username" / "Imported Subscription USN" — sent as
-   orderElement-level fields by default; flip
-   USE_ATTRIBUTE_STYLE_FOR_USN_FIELDS if OneBill wants them as
-   orderElementAttribute entries instead.
+3. "Subscription Username" / "Imported Subscription USN" are always sent as
+   orderElementAttribute entries — confirmed against a working Postman
+   payload (OneBill silently ignores them as top-level orderElement fields).
 4. RECURRING_FROM_DATE is fixed at 2026-08-01 per spec.
 5. Contacts (01_Fetch_Contacts.ipynb) are keyed by the *original* vBill
    AccountCode, not by the two bucket accounts — there's no natural
@@ -60,7 +59,7 @@ from collections import defaultdict
 import requests
 import pandas as pd
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv(override=True)
 
@@ -83,6 +82,13 @@ MIGRATION_FILES = {
     "subscriptions_resolved":  MIGRATION_DATA_DIR / "05_subscriptions_resolved.csv",
     "address_results":         MIGRATION_DATA_DIR / "06_address_creation_results.csv",
     "order_results":           MIGRATION_DATA_DIR / "07_order_creation_results.csv",
+
+    # Inactive-subscription pipeline (separate from the active one above —
+    # no Voyager lookup, no new address; see 05/06/07_..._Inactive_....ipynb)
+    "subscriptions_inactive_raw":       MIGRATION_DATA_DIR / "05_subscriptions_inactive_raw.csv",
+    "subscriptions_inactive_resolved":  MIGRATION_DATA_DIR / "05_subscriptions_inactive_resolved.csv",
+    "address_results_inactive":         MIGRATION_DATA_DIR / "06_address_results_inactive.csv",
+    "order_results_inactive":           MIGRATION_DATA_DIR / "07_order_results_inactive.csv",
 }
 
 
@@ -134,6 +140,13 @@ def load_subscriptions_resolved() -> pd.DataFrame:
     load_df("subscriptions_resolved") in 06_Create_Addresses.ipynb and
     07_Create_Subscription_Orders.ipynb."""
     return load_df("subscriptions_resolved", dtype=SUBSCRIPTIONS_RESOLVED_DTYPES)
+
+
+def load_subscriptions_inactive_resolved() -> pd.DataFrame:
+    """Same as load_subscriptions_resolved(), but for the separate inactive
+    pipeline's output — use in 06_Attach_Inactive_Addresses.ipynb and
+    07_Create_Inactive_Subscription_Orders.ipynb."""
+    return load_df("subscriptions_inactive_resolved", dtype=SUBSCRIPTIONS_RESOLVED_DTYPES)
 
 
 # ---------------------------------------------------------------------------
@@ -555,12 +568,10 @@ DEFAULT_ORDER_STATE = "1005"
 DEFAULT_ACTION_TYPE  = "New"
 DEFAULT_QUANTITY     = 1
 
-USE_ATTRIBUTE_STYLE_FOR_USN_FIELDS = True        # confirmed against working Postman payload —
-                                                   # OneBill wants these as orderElementAttribute
-                                                   # entries ("Imported Subscription USN" /
-                                                   # "Subscription Username"), not as top-level
-                                                   # orderElement fields (importedSubscriptionUsn /
-                                                   # subscriptionUsername), which it silently ignores
+# Subscription Username / Imported Subscription USN are always sent as
+# orderElementAttribute entries (confirmed against the working Postman
+# payload — OneBill silently ignores them as top-level orderElement fields
+# like importedSubscriptionUsn/subscriptionUsername). No toggle needed.
 ATTACH_CONTACT_SUMMARY_TO_ORDER    = True        # see assumption #5 above
 
 # Used when a subscription's plan code has no match in the product/price-plan
@@ -996,6 +1007,12 @@ def _title(value) -> str | None:
 def get_voyager_address(session: requests.Session, supplier_service_id) -> dict:
     """Resolve one subscription's real address + radius username via Voyager.
 
+    Only call this for ACTIVE subscriptions — see 05_Fetch_Subscriptions.ipynb.
+    Inactive subscriptions (SubscriptionEndDate in the past) skip Voyager
+    entirely; their circuits are typically already decommissioned there
+    (404/empty response), so there's nothing useful to look up. Their Radius
+    Username comes straight from the MySQL SubscriptionLabel instead.
+
     Returns a dict (always these keys, so downstream code doesn't need to
     guard for missing keys):
         {
@@ -1069,7 +1086,7 @@ def get_voyager_address(session: requests.Session, supplier_service_id) -> dict:
 # e.g. "circuits lookup failed: 500 Server Error: ..." or "... 503 ...".
 # Deliberately does NOT match 404 ("Not Found" — permanent, not transient) or
 # "no SupplierServiceID on this subscription" (a data problem, not an API one).
-_VOYAGER_5XX_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+_VOYAGER_5XX_ERROR_PATTERN = re.compile(r"\b(?:500|502|503|504)\b")
 
 
 def voyager_second_pass(
@@ -1468,6 +1485,40 @@ def _find_address_id_by_location(
     return "not_found", None, None
 
 
+def find_default_shipping_address_id(session: requests.Session, account_number: str) -> tuple[str, str | None, str | None]:
+    """GET the account and find whichever address currently has defaultShipping
+    set. Used for INACTIVE subscriptions (SubscriptionEndDate in the past) in
+    06_Create_Addresses.ipynb — instead of creating a new address, they attach
+    to whatever the account's current default service address already is.
+
+    IMPORTANT: only call this AFTER every ACTIVE subscription for this account
+    has already had its address created. defaultShipping gets set to true on
+    every newly-created address (see add_address_to_account), so which address
+    is "the current default" isn't settled until the active pass for that
+    account is finished — calling this concurrently with, or before, that pass
+    can pick up a default that's about to be superseded.
+
+    Returns (status, address_id, error):
+        "found"     -> address_id is the current default address's real id
+        "not_found" -> account has no address with defaultShipping set (address_id/error are None)
+        "failed"    -> the GET itself failed; error has details
+    """
+    url = f"{ONEBILL_SUBSCRIBER_URL}/{account_number}"
+    try:
+        response = onebill_request(session, "get", url, timeout=30)
+        _raise_for_status_with_body(response)
+        data = response.json()
+    except Exception as e:
+        return "failed", None, str(e)
+
+    for address in data.get("address", []):
+        is_default = address.get("defaultShipping")
+        if is_default is True or str(is_default).strip().lower() == "true":
+            return "found", str(address.get("id")), None
+
+    return "not_found", None, None
+
+
 # ---------------------------------------------------------------------------
 # Order creation (OrderService) — used by 07_Create_Subscription_Orders.ipynb
 # ---------------------------------------------------------------------------
@@ -1480,3 +1531,212 @@ def create_onebill_order(session: requests.Session, payload: dict) -> dict:
     if not ok:
         raise ValueError(message)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Shared by BOTH 07_Create_Subscription_Orders.ipynb (active) and
+# 07_Create_Inactive_Subscription_Orders.ipynb (inactive) — one implementation,
+# not two copies to keep in sync. The two notebooks differ only in which
+# dataframes they load and merge before calling create_all_orders().
+# ---------------------------------------------------------------------------
+def make_plan_resolver(df_plan_mapping: pd.DataFrame):
+    """Build a resolve_plan(plan_code) -> (productName, priceplanName, matched)
+    closure from a plan_mapping dataframe (03_plan_code_mapping.csv)."""
+    plan_mapping = {
+        str(row["PlanCode"]).strip().upper(): (row["product_name"], row["priceplan_name"])
+        for _, row in df_plan_mapping.iterrows()
+    }
+
+    def resolve_plan(plan_code) -> tuple[str, str, bool]:
+        """Returns (productName, priceplanName, matched). matched=False means STATIC_FALLBACK_PLAN was used."""
+        key = str(plan_code).strip().upper() if plan_code is not None else None
+        if key in plan_mapping:
+            product_name, priceplan_name = plan_mapping[key]
+            return product_name, priceplan_name, True
+        return STATIC_FALLBACK_PLAN["productName"], STATIC_FALLBACK_PLAN["priceplanName"], False
+
+    return resolve_plan
+
+
+def make_contact_summary_fn(df_contacts: pd.DataFrame | None):
+    """Build a contact_summary_attributes(account_code) -> list[dict] closure
+    from a contacts dataframe (01_contacts_by_account.csv)."""
+    contact_by_account = (
+        {str(row["AccountCode"]): row for _, row in df_contacts.iterrows()}
+        if df_contacts is not None else {}
+    )
+
+    def contact_summary_attributes(account_code) -> list[dict]:
+        if not ATTACH_CONTACT_SUMMARY_TO_ORDER:
+            return []
+        contact = contact_by_account.get(str(account_code))
+        if contact is None:
+            return []
+        attrs = []
+        if clean(contact.get("ContactName")):
+            attrs.append({"featureName": "Original Contact Name", "value": contact["ContactName"]})
+        if clean(contact.get("ContactEmail")):
+            attrs.append({"featureName": "Original Contact Email", "value": contact["ContactEmail"]})
+        if clean(contact.get("ContactPhone")):
+            attrs.append({"featureName": "Original Contact Phone", "value": str(contact["ContactPhone"])})
+        return attrs
+
+    return contact_summary_attributes
+
+
+def build_subscription_order_payload(
+    subscription: dict, ship_add_id: str, product_name: str, priceplan_name: str,
+    contact_summary_attributes_fn=None,
+) -> dict:
+    # clean() turns NaN/blank into None so the fallbacks below actually fire — NaN is
+    # truthy in Python, so an un-cleaned NaN silently skips an "or" fallback and ends up
+    # in the JSON payload, which `requests` then refuses to serialize
+    # ("Out of range float values are not JSON compliant: nan"). Same class of bug as the
+    # one fixed earlier in add_address_to_account.
+    quantity = clean(subscription.get("Quantity"))
+    quantity = quantity if quantity is not None else DEFAULT_QUANTITY
+
+    supplier_service_id = clean(subscription.get("SupplierServiceID"))
+
+    # ParsedAddress_radius_user is set by BOTH pipelines: from Voyager's
+    # radiusUsers[0] for active subscriptions, or straight from SubscriptionLabel
+    # for inactive ones (no Voyager lookup — see 05_Fetch_Inactive_Subscriptions.ipynb).
+    # The "or" fallback here only matters if that column is missing entirely.
+    radius_username = clean(subscription.get("ParsedAddress_radius_user")) or clean(subscription.get("SubscriptionLabel"))
+
+    # --- term / follow-on term -------------------------------------------------
+    # term = 0 (no follow-on) unless the subscription has a SubscriptionEndDate
+    # or a NextPlanStartDate, in which case term = 1 and OneBill needs a
+    # followOnTermDetails block whose `term` is the whole number of months
+    # between today and the subscription's end date.
+    subscription_end_date = clean(subscription.get("SubscriptionEndDate"))
+    next_plan_start_date = clean(subscription.get("NextPlanStartDate"))
+    has_follow_on_term = subscription_end_date is not None or next_plan_start_date is not None
+
+    order_element = {
+        "quantity":               quantity,
+        "actionType":             DEFAULT_ACTION_TYPE,
+        "fulfilledDate":          to_iso_midnight(subscription["SubscriptionStartDate"]),  # activation date
+        "recurringStartDate":     RECURRING_FROM_DATE,                                       # fixed 2026-08-01
+        "productName":            product_name,
+        "priceplanName":          priceplan_name,
+        "shipAddId":              ship_add_id,
+        "term":                   1 if has_follow_on_term else 0,
+    }
+
+    if has_follow_on_term:
+        # Prefer SubscriptionEndDate as the reference date for the month count;
+        # fall back to NextPlanStartDate if only that is populated.
+        follow_on_reference_date = subscription_end_date or next_plan_start_date
+        follow_on_months = months_between(datetime.now(), follow_on_reference_date)
+
+        order_element["termAction"] = 1
+        order_element["followOnTermDetails"] = {
+            "term":         follow_on_months,
+            "termMode":     "M",
+            "termAction":   1,
+            "termAligned":  False,
+            "termType":     0,
+        }
+
+    order_element_attributes = [
+        {"featureName": "Radius Username", "type": "0", "value": str(radius_username)},
+        {"featureName": "External Service ID", "value": supplier_service_id},
+    ]
+
+    vendor = resolve_vendor(subscription.get("Supplier"))
+    if vendor is not None:
+        order_element_attributes.append({"featureName": "Vendor", "value": vendor})
+    elif clean(subscription.get("Supplier")) is not None:
+        # Supplier is populated but isn't Chorus/Enable/UFF — flag it rather than
+        # silently omitting the Vendor attribute. See SUPPLIER_TO_VENDOR above.
+        logger.warning(
+            f"subscription {subscription.get('SubscriptionUSN')} has an unmapped Supplier "
+            f"({subscription.get('Supplier')!r}) — order created without a Vendor attribute"
+        )
+
+    # Subscription Username / Imported Subscription USN are always sent as
+    # orderElementAttribute entries, exactly once — see assumption #3 above.
+    order_element_attributes.extend([
+        {"featureName": "Subscription Username", "value": str(subscription["SubscriptionLabel"])},
+        {"featureName": "Imported Subscription USN", "value": str(subscription["SubscriptionUSN"])},
+    ])
+
+    if contact_summary_attributes_fn is not None:
+        order_element_attributes.extend(contact_summary_attributes_fn(subscription.get("AccountCode")))
+
+    # orderElementAttribute lives INSIDE the orderElement item, not as a sibling
+    # key on the outer payload — confirmed against the working Postman example.
+    order_element["orderElementAttribute"] = order_element_attributes
+
+    return {
+        "accountNumber":      str(subscription["TargetAccountNumber"]),
+        "orderState":         DEFAULT_ORDER_STATE,
+        "billThissOrder":     False,
+        "isSkipProvisioning": True,
+        "orderElement":       [order_element],
+    }
+
+
+def create_order_for_subscription(
+    session: requests.Session, subscription: dict, resolve_plan_fn, contact_summary_attributes_fn=None,
+) -> dict:
+    subscription_id = subscription["SubscriptionUSN"]
+
+    result = {
+        "SubscriptionUSN":      subscription_id,
+        "TargetAccountNumber":  subscription["TargetAccountNumber"],
+        "status":               "failed",
+        "plan_matched":         None,
+        "productName":          None,
+        "priceplanName":        None,
+        "onebill_order_id":     None,
+        "error":                None,
+    }
+
+    try:
+        product_name, priceplan_name, matched = resolve_plan_fn(subscription.get(SUBSCRIPTION_PLANCODE_COLUMN))
+        result["plan_matched"]  = matched
+        result["productName"]   = product_name
+        result["priceplanName"] = priceplan_name
+
+        payload = build_subscription_order_payload(
+            subscription, subscription["ship_add_id"], product_name, priceplan_name,
+            contact_summary_attributes_fn=contact_summary_attributes_fn,
+        )
+        response = create_onebill_order(session, payload)
+
+        result["status"] = "success"
+        result["onebill_order_id"] = response.get("orderId", "unknown")
+        logger.info(f"[OK] subscription {subscription_id} -> {subscription['TargetAccountNumber']} "
+                    f"(plan_matched={matched}, orderId={result['onebill_order_id']})")
+
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error(f"[FAIL] subscription {subscription_id} — {e}")
+
+    return result
+
+
+def create_all_orders(
+    df: pd.DataFrame, resolve_plan_fn, contact_summary_attributes_fn=None, max_workers: int = MAX_WORKERS,
+) -> pd.DataFrame:
+    session = new_session(max_workers=max_workers)
+    rows = df.to_dict("records")
+    total = len(rows)
+    results = []
+
+    logger.info(f"Creating orders for {total:,} subscriptions with {max_workers} workers...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(create_order_for_subscription, session, row, resolve_plan_fn, contact_summary_attributes_fn): row["SubscriptionUSN"]
+            for row in rows
+        }
+        for i, future in enumerate(as_completed(futures), start=1):
+            results.append(future.result())
+            if i % 50 == 0 or i == total:
+                ok = sum(1 for r in results if r["status"] == "success")
+                logger.info(f"Progress: {i}/{total} — {ok} succeeded so far")
+
+    return pd.DataFrame(results)
