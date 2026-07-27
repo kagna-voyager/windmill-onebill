@@ -1322,8 +1322,18 @@ _address_creation_locks: dict[tuple[str, str], threading.Lock] = {}
 _address_creation_locks_guard = threading.Lock()
 
 
-def _get_location_lock(account_number: str, location_id: str) -> threading.Lock:
-    key = (str(account_number), str(location_id))
+def _get_location_lock(account_number: str) -> threading.Lock:
+    """One lock PER ACCOUNT (not per (account, location_id) — that finer-grained
+    keying never actually contends, since every subscription has a unique
+    location_id, so concurrent workers could still race on the SAME account.
+    OneBill's PUT-address endpoint appears to do a non-atomic read-then-write
+    of the account's whole address list, so two concurrent PUTs against the
+    same account can each read the list before the other's write lands, and
+    each write back a version missing the other's addition — the PUT reports
+    success either way, but a follow-up GET only shows one of the two.
+    Serializing per account (not per location) is what actually prevents that.
+    """
+    key = str(account_number)
     with _address_creation_locks_guard:
         if key not in _address_creation_locks:
             _address_creation_locks[key] = threading.Lock()
@@ -1374,7 +1384,7 @@ def add_address_to_account(
     region_iso  = clean(region_iso)
     location_id = clean(location_id)
 
-    with _get_location_lock(account_number, location_id):
+    with _get_location_lock(account_number):
         return _put_address_locked(
             session, account_number, add_line1, location_id, address2, city, zip_code, region_iso,
         )
@@ -1391,7 +1401,7 @@ def _put_address_locked(
     region_iso: str | None,
 ) -> tuple[str, str | None, str | None]:
     """The actual check-then-create body of add_address_to_account, run while
-    holding that (account_number, location_id)'s lock — see _get_location_lock."""
+    holding that account's lock — see _get_location_lock."""
 
     # Idempotency check: this endpoint always APPENDS a new address rather than
     # upserting by Location Id, and doesn't reject a genuine duplicate the way
@@ -1416,7 +1426,7 @@ def _put_address_locked(
                 "addLine1":        add_line1,
                 "addLine2":        address2 or "",
                 "defaultShipping": True,
-                "locationAttributes": [
+                "addressAttribute": [
                     {"key": "Location Id", "value": location_id},
                 ],
             }
