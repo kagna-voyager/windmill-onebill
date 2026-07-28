@@ -1625,7 +1625,7 @@ def build_subscription_order_payload(
         "quantity":               quantity,
         "actionType":             "New",
         "fulfilledDate":          subscription_start_date,
-        "recurringStartDate":     "2026-07-01T00:00:00",                                      
+        "recurringStartDate":     "2026-08-01T00:00:00",                                      
         "productName":            product_name,
         "priceplanName":          priceplan_name,
         "shipAddId":              ship_add_id,
