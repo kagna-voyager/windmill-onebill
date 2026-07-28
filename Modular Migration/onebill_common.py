@@ -998,12 +998,6 @@ def fetch_voyager_address(session: requests.Session, location_id: str) -> dict:
     return response.json()
 
 
-def _title(value) -> str | None:
-    """Title-case a possibly-None/NaN/all-caps string; None-safe."""
-    value = clean(value)
-    return str(value).title() if value is not None else None
-
-
 def get_voyager_address(session: requests.Session, supplier_service_id) -> dict:
     """Resolve one subscription's real address + radius username via Voyager.
 
@@ -1064,9 +1058,9 @@ def get_voyager_address(session: requests.Session, supplier_service_id) -> dict:
         result["error"] = f"address-search lookup failed: {e}"
         return result
 
-    result["addLine1"]         = _title(address.get("street_address"))
-    result["addLine2"]         = _title(address.get("locality_name"))
-    result["city"]             = _title(address.get("town_name"))
+    result["addLine1"]         = clean(address.get("street_address"))
+    result["addLine2"]         = clean(address.get("locality_name"))
+    result["city"]             = clean(address.get("town_name"))
     result["postcode"]         = clean(address.get("postcode_zone"))
     result["region_name"]      = address.get("region_name")
     result["region_code_raw"]  = clean(address.get("region_code"))
@@ -1607,6 +1601,8 @@ def build_subscription_order_payload(
     quantity = quantity if quantity is not None else DEFAULT_QUANTITY
 
     supplier_service_id = clean(subscription.get("SupplierServiceID"))
+    customer_supplied_reference = clean(subscription.get("CustomerSuppliedReference"))
+    voyager_order_history = clean(subscription.get("_notforreports_VoyagerOrderHistory"))
 
     # ParsedAddress_radius_user is set by BOTH pipelines: from Voyager's
     # radiusUsers[0] for active subscriptions, or straight from SubscriptionLabel
@@ -1620,18 +1616,22 @@ def build_subscription_order_payload(
     # followOnTermDetails block whose `term` is the whole number of months
     # between today and the subscription's end date.
     subscription_end_date = clean(subscription.get("SubscriptionEndDate"))
+    subscription_start_date = clean(subscription.get("SubscriptionStartDate"))
     next_plan_start_date = clean(subscription.get("NextPlanStartDate"))
     has_follow_on_term = subscription_end_date is not None or next_plan_start_date is not None
 
     order_element = {
+        "subscriptionIdentifier": radius_username,
         "quantity":               quantity,
-        "actionType":             DEFAULT_ACTION_TYPE,
-        "fulfilledDate":          to_iso_midnight(subscription["SubscriptionStartDate"]),  # activation date
-        "recurringStartDate":     RECURRING_FROM_DATE,                                       # fixed 2026-08-01
+        "actionType":             "New",
+        "fulfilledDate":          subscription_start_date,
+        "recurringStartDate":     "2026-07-01T00:00:00",                                      
         "productName":            product_name,
         "priceplanName":          priceplan_name,
         "shipAddId":              ship_add_id,
-        "term":                   1 if has_follow_on_term else 0,
+        "term":                   "0",
+        "termMode":               "M",
+        "termAction":             "1",
     }
 
     if has_follow_on_term:
@@ -1640,18 +1640,12 @@ def build_subscription_order_payload(
         follow_on_reference_date = subscription_end_date or next_plan_start_date
         follow_on_months = months_between(datetime.now(), follow_on_reference_date)
 
-        order_element["termAction"] = 1
-        order_element["followOnTermDetails"] = {
-            "term":         follow_on_months,
-            "termMode":     "M",
-            "termAction":   1,
-            "termAligned":  False,
-            "termType":     0,
-        }
-
     order_element_attributes = [
         {"featureName": "Radius Username", "type": "0", "value": str(radius_username)},
         {"featureName": "External Service ID", "value": supplier_service_id},
+        {"featureName": "Customer Supplied Reference", "value": customer_supplied_reference},
+        {"featureName": "vBill Order History", "value": voyager_order_history},
+        {"featureName": "Subscription USN Imported", "value": str(subscription["SubscriptionUSN"])},
     ]
 
     vendor = resolve_vendor(subscription.get("Supplier"))
@@ -1665,12 +1659,6 @@ def build_subscription_order_payload(
             f"({subscription.get('Supplier')!r}) — order created without a Vendor attribute"
         )
 
-    # Subscription Username / Imported Subscription USN are always sent as
-    # orderElementAttribute entries, exactly once — see assumption #3 above.
-    order_element_attributes.extend([
-        {"featureName": "Subscription Username", "value": str(subscription["SubscriptionLabel"])},
-        {"featureName": "Imported Subscription USN", "value": str(subscription["SubscriptionUSN"])},
-    ])
 
     if contact_summary_attributes_fn is not None:
         order_element_attributes.extend(contact_summary_attributes_fn(subscription.get("AccountCode")))
@@ -1681,7 +1669,7 @@ def build_subscription_order_payload(
 
     return {
         "accountNumber":      str(subscription["TargetAccountNumber"]),
-        "orderState":         DEFAULT_ORDER_STATE,
+        "orderState":         "1005",
         "billThissOrder":     False,
         "isSkipProvisioning": True,
         "orderElement":       [order_element],
