@@ -409,7 +409,7 @@ def build_account_payload(row: dict, contacts_by_account: dict[str, list[dict]])
         "addLine2":        row.get("Address2"),
         "county":          "",
         "city":            row.get("City"),
-        "state":           None,
+        "state":           row.get("State"),
         "country":         "New Zealand",
         "zip":             str(row["Postcode"]) if row.get("Postcode") is not None else None,
         "defaultShipping": True,
@@ -430,11 +430,11 @@ def build_account_payload(row: dict, contacts_by_account: dict[str, list[dict]])
         "activationStartDate":   activation_start_date,
         "address":               [address_block],
         "contact":               contact_list,
-        "accountAttribute": [
-            {"key": "vBill Account Types",  "value": row.get("AccountType")},
-            {"key": "Date Of Birth",        "value": _serialize_date(row.get("DateOfBirth"), "%d/%m/%Y")},
-            {"key": "vBill Account Name",   "value": row.get("AccountName_Original")},
-        ],
+        # "accountAttribute": [
+        #     {"key": "vBill Account Types",  "value": row.get("AccountType")},
+        #     {"key": "Date Of Birth",        "value": _serialize_date(row.get("DateOfBirth"), "%d/%m/%Y")},
+        #     {"key": "vBill Account Name",   "value": row.get("AccountName_Original")},
+        # ],
     }
 
     return json.dumps(payload)
@@ -455,7 +455,7 @@ ONEBILL_PRODUCT_DETAIL_URL = f"{ONEBILL_BASE_URL}/rest/ProductService/v1/product
 ONEBILL_PROXY_ACCT = os.environ.get("CREATION_PROXY_ACCOUNT_NUMBER", "")
 
 TOKEN_TTL_FALLBACK = 3500  # seconds, used only if OAuth response omits expires_in
-MAX_WORKERS         = 10
+MAX_WORKERS        = 3
 
 # ---------------------------------------------------------------------------
 # Voyager address lookup (circuits -> address-search) — used by
