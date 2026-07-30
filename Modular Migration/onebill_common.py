@@ -550,9 +550,48 @@ TARGET_ACCOUNTS = {
     },
 }
 
-# Marker matched case-insensitively against the subscription's Reference
-# field. Anything that does NOT match goes to "williams_corporation".
-MANAGED_BY_WILLIAMS_MARKER = "managed by williams"
+# Matched case-insensitively against the subscription's Reference field, as
+# either the full phrase OR the "MBW" abbreviation. MBW is short enough that a
+# plain substring match risks false positives (e.g. matching inside an
+# unrelated word), so it's matched as a whole word via \b.
+MANAGED_BY_WILLIAMS_MARKER = "managed by williams"   # kept for reference/back-compat; use the pattern below for matching
+MANAGED_BY_WILLIAMS_PATTERN = re.compile(r"managed by williams|\bmbw\b", re.IGNORECASE)
+
+
+def is_managed_by_williams_reference(reference_series: pd.Series) -> pd.Series:
+    """Vectorized check for the Managed-by-Williams marker (full phrase or the
+    "MBW" abbreviation) in a Reference column. NaN-safe."""
+    return reference_series.fillna("").astype(str).str.contains(MANAGED_BY_WILLIAMS_PATTERN, regex=True)
+
+
+# Fixed-account routing: subscriptions whose Reference contains one of these
+# markers (case-insensitive substring match) go straight to the given,
+# ALREADY-EXISTING OneBill account — unlike TARGET_ACCOUNTS above, these are
+# NOT created by 04_Create_Accounts.ipynb and NOT looked up via
+# account_results.csv; the account_number is the final, real value as given.
+# Checked in the order listed, at the SAME priority as Managed by Williams —
+# i.e. before own-account routing, so it overrides a subscription's own
+# account if one happens to exist.
+FIXED_REFERENCE_ACCOUNTS = [
+    {
+        "marker":         "williams real estate",
+        "account_key":    "williams_real_estate",
+        "account_number": os.environ.get("WILLIAMS_REAL_ESTATE_ACCOUNT_NUMBER", "ACCT2302"),
+        "account_name":   "Williams Real Estate Limited",
+    },
+    {
+        "marker":         "toa koura",
+        "account_key":    "toa_koura",
+        "account_number": os.environ.get("TOA_KOURA_ACCOUNT_NUMBER", "ACCT2303"),
+        "account_name":   "Toa Koura Limited",
+    },
+    {
+        "marker":         "design by williams",
+        "account_key":    "design_by_williams",
+        "account_number": os.environ.get("DESIGN_BY_WILLIAMS_ACCOUNT_NUMBER", "ACCT2305"),
+        "account_name":   "Design by Williams Limited",
+    },
+]
 
 # Optional suffix appended to every bulk-migrated AccountCode when building
 # the OneBill accountNumber (AccountCode_Batch) — handy for test runs so you
@@ -1144,12 +1183,73 @@ def voyager_second_pass(
     return df
 
 
-def resolve_target_account(reference) -> dict:
-    """Given a subscription's Reference value, return the TARGET_ACCOUNTS entry it belongs to."""
-    ref = "" if reference is None or (isinstance(reference, float) and pd.isna(reference)) else str(reference)
-    if MANAGED_BY_WILLIAMS_MARKER in ref.lower():
-        return TARGET_ACCOUNTS["managed_by_williams"]
-    return TARGET_ACCOUNTS["williams_corporation"]
+def resolve_target_accounts(
+    df: pd.DataFrame,
+    own_account_map: dict[str, str],
+    real_account_numbers: dict[str, str],
+    reference_column: str = "CustomerSuppliedReference",
+) -> pd.DataFrame:
+    """Add TargetAccountKey / TargetAccountNumber columns to df, in this priority order:
+
+    1. Managed by Williams (Reference contains the full phrase or "MBW") -> the
+       managed_by_williams bucket account. Overrides own-account routing.
+    2. Any FIXED_REFERENCE_ACCOUNTS marker (Williams Real Estate / Toa Koura /
+       Design by Williams) -> that marker's fixed, already-existing account.
+       Also overrides own-account routing. Checked in FIXED_REFERENCE_ACCOUNTS
+       order; first match wins.
+    3. Everyone else -> own account, via AccountCode -> own_account_map.
+    4. Still no account (own account missing/failed in 04) -> williams_corporation
+       bucket fallback.
+
+    own_account_map / real_account_numbers: from load_account_code_batch_map()
+    and load_real_target_account_numbers() respectively — pass these in rather
+    than loading them here so callers only hit disk once per notebook run.
+
+    Used by BOTH 05_Fetch_Subscriptions.ipynb and
+    05_Fetch_Inactive_Subscriptions.ipynb — one implementation, not two copies
+    to keep in sync.
+    """
+    df = df.copy()
+    df["AccountCode"] = df["AccountCode"].astype(str)
+
+    managed_by_williams_number = real_account_numbers.get(
+        "managed_by_williams", TARGET_ACCOUNTS["managed_by_williams"]["account_number"]
+    )
+    williams_corporation_number = real_account_numbers.get(
+        "williams_corporation", TARGET_ACCOUNTS["williams_corporation"]["account_number"]
+    )
+
+    df["TargetAccountKey"] = None
+    df["TargetAccountNumber"] = None
+
+    reference = df[reference_column] if reference_column in df.columns else pd.Series(None, index=df.index)
+    reference_lower = reference.fillna("").astype(str).str.lower()
+
+    # 1. Managed by Williams — highest priority, overrides own account.
+    is_managed_by_williams = is_managed_by_williams_reference(reference)
+    df.loc[is_managed_by_williams, "TargetAccountKey"] = "managed_by_williams"
+    df.loc[is_managed_by_williams, "TargetAccountNumber"] = managed_by_williams_number
+
+    # 2. Fixed-reference accounts — same priority tier as Managed by Williams.
+    #    Only considered for rows not already claimed by step 1.
+    still_unassigned = df["TargetAccountKey"].isna()
+    for entry in FIXED_REFERENCE_ACCOUNTS:
+        is_match = still_unassigned & reference_lower.str.contains(entry["marker"], regex=False)
+        df.loc[is_match, "TargetAccountKey"] = entry["account_key"]
+        df.loc[is_match, "TargetAccountNumber"] = entry["account_number"]
+        still_unassigned = df["TargetAccountKey"].isna()
+
+    # 3. Everyone else — own account first.
+    not_specially_routed = df["TargetAccountKey"].isna()
+    df.loc[not_specially_routed, "TargetAccountNumber"] = df.loc[not_specially_routed, "AccountCode"].map(own_account_map)
+    df.loc[not_specially_routed & df["TargetAccountNumber"].notna(), "TargetAccountKey"] = "own_account"
+
+    # 4. Still nothing — Williams Corporation bucket fallback.
+    missing_own_account = not_specially_routed & df["TargetAccountNumber"].isna()
+    df.loc[missing_own_account, "TargetAccountKey"] = "williams_corporation"
+    df.loc[missing_own_account, "TargetAccountNumber"] = williams_corporation_number
+
+    return df
 
 
 def load_real_target_account_numbers() -> dict[str, str]:
