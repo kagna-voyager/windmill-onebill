@@ -540,15 +540,21 @@ SUBSCRIPTION_PLAN_CONTEXT_COLUMNS: list[str] = []
 # "CANTERBURY REGION" — the trailing "REGION" word is stripped before
 # matching against the spreadsheet's "Canterbury" so the lookup actually hits.
 # ---------------------------------------------------------------------------
-NZ_REGIONS_FILE = pathlib.Path(
-    os.environ.get("NZ_REGIONS_FILE", str(pathlib.Path.cwd().parent / "NZ_Regions.xlsx"))
-)
+_nz_regions_env = (os.environ.get("NZ_REGIONS_FILE") or "").strip()
+NZ_REGIONS_FILE = pathlib.Path(_nz_regions_env) if _nz_regions_env else (pathlib.Path.cwd().parent / "NZ_Regions.xlsx")
 
 
 def _load_region_iso_map() -> dict[str, str]:
     if not NZ_REGIONS_FILE.exists():
         return {}
-    df = pd.read_excel(NZ_REGIONS_FILE)
+    try:
+        df = pd.read_excel(NZ_REGIONS_FILE)
+    except Exception as e:
+        print(
+            f"WARNING: Could not read NZ_Regions.xlsx at {NZ_REGIONS_FILE.resolve()} ({type(e).__name__}: {e}) — "
+            f"region_name_to_iso() will return None until the file is readable."
+        )
+        return {}
     return {
         str(row["Region"]).strip().upper(): str(row["Code"]).strip()
         for _, row in df.iterrows()
@@ -852,7 +858,7 @@ class TokenManager:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=30,
         )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         payload = response.json()
         self._token = payload["access_token"]
         ttl = payload.get("expires_in", TOKEN_TTL_FALLBACK)
