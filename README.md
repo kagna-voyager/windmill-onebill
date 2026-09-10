@@ -9,6 +9,7 @@ MySQL Connections:
 DB_USERNAME=
 DB_PASSWORD=
 DB_HOST=
+DB_PORT= (optional; default MySQL port is used when blank)
 
 OneBill Connections:
 CLIENT_ID=

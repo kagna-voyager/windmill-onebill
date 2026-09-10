@@ -61,7 +61,14 @@ import pandas as pd
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-load_dotenv(override=True)
+DOTENV_PATH = pathlib.Path(__file__).with_name(".env")
+if DOTENV_PATH.exists():
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    LOADED_DOTENV_PATH = DOTENV_PATH
+else:
+    # Fallback keeps prior behavior if this module is copied without a sibling .env
+    load_dotenv(override=True)
+    LOADED_DOTENV_PATH = None
 
 # ---------------------------------------------------------------------------
 # Shared data folder — the hand-off mechanism between notebooks
@@ -518,10 +525,19 @@ VOYAGER_ADDRESS_SEARCH_URL = "https://api.voyager.nz/address-search/v3/addresses
 # ---------------------------------------------------------------------------
 # MySQL
 # ---------------------------------------------------------------------------
+_db_username = os.environ.get("DB_USERNAME")
+_db_password = os.environ.get("DB_PASSWORD")
+_db_host = os.environ.get("DB_HOST")
+_db_port = (os.environ.get("DB_PORT") or "").strip()
+
+_db_host_with_port = _db_host
+if _db_host and _db_port and ":" not in _db_host:
+    _db_host_with_port = f"{_db_host}:{_db_port}"
+
 BI_DATASTORE_URL = (
-    f"mysql+mysqlconnector://{os.environ.get('DB_USERNAME')}:{os.environ.get('DB_PASSWORD')}"
-    f"@{os.environ.get('DB_HOST')}/bi_datastore"
-) if os.environ.get("DB_USERNAME") else None
+    f"mysql+mysqlconnector://{urllib.parse.quote_plus(_db_username or '')}:{urllib.parse.quote_plus(_db_password or '')}"
+    f"@{_db_host_with_port}/bi_datastore"
+) if _db_username else None
 
 # TODO(assumption #2): confirm these column names against the real query result.
 SUBSCRIPTION_REFERENCE_COLUMN = "CustomerSuppliedReference"

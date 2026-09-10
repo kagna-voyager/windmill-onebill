@@ -61,7 +61,14 @@ import pandas as pd
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-load_dotenv(override=True)
+DOTENV_PATH = pathlib.Path(__file__).with_name(".env")
+if DOTENV_PATH.exists():
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    LOADED_DOTENV_PATH = DOTENV_PATH
+else:
+    # Fallback keeps prior behavior if this module is copied without a sibling .env
+    load_dotenv(override=True)
+    LOADED_DOTENV_PATH = None
 
 # ---------------------------------------------------------------------------
 # Shared data folder — the hand-off mechanism between notebooks
