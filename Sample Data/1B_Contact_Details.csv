@@ -1,9 +1,0 @@
-Account_Number,Username,Company_Name,First_Name,Last_Name,Designation,Party Type,Priority,Contact_Type,Phone,APhone,CPhone,Email,Registration_Status,Created Date,Account Type,Parent Account Number
-ID00001,Ava Smith,Ava Smith,Ava Smith,Ava Smith,,Subscriber, ,0400000001,,,,user001@example.com,Not Registered,13/04/2026 09:28:22,,
-ID00002,Ava Smith,Noah Brown,Noah Brown,Noah Brown, ,Subscriber, ,0400000001,,,,user002@example.com,Not Registered,19/05/2026 10:25:50,,
-ID00003,Ava Smith,Liam Taylor,Liam Taylor,Liam Taylor,,Subscriber, ,0400000001,,,,user003@example.com,Not Registered,13/04/2026 09:30:02,,
-ID00004,Ava Smith,Mia Wilson,Noah Brown,Mia Wilson, ,Subscriber, ,0400000001,,,,user004@example.com,Not Registered,19/05/2026 09:00:03,,
-ID00005,Ava Smith,Ethan Lee,Mia Wilson,Ethan Lee, ,Subscriber, ,0400000001,0400000001,,,user005@example.com,Not Registered,18/05/2026 13:37:53,,
-ID00006,Ava Smith,Mia Wilson,Noah Brown,Mia Wilson, ,Subscriber, ,0400000001,,,,user004@example.com,Not Registered,19/05/2026 09:01:54,,
-ID00007,Ava Smith,Emma Martin,Ethan Lee,Emma Martin,,Subscriber, ,0400000001,,,,user006@example.com,Not Registered,13/04/2026 09:26:39,,
-ID00008,Ava Smith,Lucas Davis,Emma Martin,Lucas Davis, ,Subscriber, ,0400000002,0400000002,,,user007@example.com,Not Registered,31/07/2026 20:28:33,,
