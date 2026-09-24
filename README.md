@@ -64,3 +64,65 @@ Example return shape:
 	"rows": [{"...": "..."}]
 }
 ```
+
+## Windmill flow: read, preview, write to database
+
+Create three Python scripts in Windmill using files from this repository.
+
+Step 1 script:
+
+- Source file: `windmill_step1_load_csvs.py`
+- Function: `main`
+- Purpose: read CSV files from GitHub raw URLs.
+
+Recommended inputs:
+
+- `file_names`: array, for example:
+	- `1B_Subscription.csv`
+	- `1B_Invoice_Detail.csv`
+- `row_limit`: `1000`
+
+Step 2 script:
+
+- Source file: `windmill_step2_prepare_preview.py`
+- Function: `main`
+- Purpose: clean rows and return preview output for display in job results.
+
+Recommended inputs:
+
+- `load_result`: output from Step 1
+- `preview_rows`: `5`
+
+Step 3 script:
+
+- Source file: `windmill_step3_write_database.py`
+- Function: `main`
+- Purpose: write prepared datasets to a SQL database.
+
+Recommended inputs:
+
+- `prepared_result`: output from Step 2
+- `database_url`: secure variable in Windmill
+- `table_prefix`: `sample_`
+- `write_mode`: `append` or `replace`
+- `batch_size`: `500`
+
+Example database URLs:
+
+- PostgreSQL: `postgresql+psycopg://user:pass@host:5432/dbname`
+- MySQL: `mysql+mysqlconnector://user:pass@host:3306/dbname`
+- SQL Server: `mssql+pyodbc://user:pass@host:1433/dbname?driver=ODBC+Driver+18+for+SQL+Server`
+- SQLite: `sqlite:///tmp/windmill_sample.db`
+
+Flow wiring in Windmill:
+
+1. Create flow.
+2. Add Step 1 and set file list.
+3. Add Step 2 with `load_result` mapped from Step 1 output.
+4. Add Step 3 with `prepared_result` mapped from Step 2 output.
+5. Store `database_url` as a Windmill secret and map it into Step 3.
+
+Expected result:
+
+- Step 2 displays cleaned preview rows in the job output.
+- Step 3 creates one table per CSV and inserts the data.
