@@ -1,0 +1,11 @@
+**/.pbi/localSettings.json
+**/.pbi/cache.abf
+
+# Local Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local/raw data that should not be pushed
+Data Source/
+Extracts/
