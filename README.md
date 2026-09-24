@@ -38,3 +38,29 @@ https://raw.githubusercontent.com/kagna-voyager/windmill-onebill/main/Sample%20D
 
 - `Extracts/` and `Data Source/` are local working folders and are excluded from git.
 - Keep sample files small and non-sensitive.
+
+## Windmill script example
+
+Use `windmill_load_sample_csv.py` as a Windmill Python script.
+
+What it does:
+
+- Downloads one CSV from this repo's `Sample Data/` folder using GitHub Raw.
+- Parses rows with `csv.DictReader`.
+- Returns `url`, `row_count`, `columns`, and `rows`.
+
+Input parameters:
+
+- `file_name` (default: `1B_Subscription.csv`)
+- `limit` (default: `100`)
+
+Example return shape:
+
+```json
+{
+	"url": "https://raw.githubusercontent.com/kagna-voyager/windmill-onebill/main/Sample%20Data/1B_Subscription.csv",
+	"row_count": 100,
+	"columns": ["..."],
+	"rows": [{"...": "..."}]
+}
+```
